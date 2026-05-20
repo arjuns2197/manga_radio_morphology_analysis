@@ -12,8 +12,18 @@ from astropy.coordinates import SkyCoord
 from astropy.table import Table, Column
 import funcs
 
-funcs.match_manga_to_radio()
+#funcs.match_manga_to_radio()
 
 path_data_final = "../manga_rmorph_data/manga_with_vlass_lotss_first.fits"
 data_final = fits.open(path_data_final)[1].data
 
+x = np.random.normal(0.36,0.05,(2,2,1))
+y = np.random.normal(-0.5,0.05,(2,2,1))
+
+a, b = np.histogram(x)
+
+plt.plot(b[:-1],a)
+plt.show()
+
+print(b)
+print(a)

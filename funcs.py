@@ -19,6 +19,8 @@ import matplotlib.patheffects as pe
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from matplotlib.colors import ListedColormap
 from matplotlib.colors import SymLogNorm
+import statistics
+import time
 
 # Paths
 map_dir = Path("../manga_rmorph_data/manga_maps")
@@ -150,6 +152,53 @@ def add_power_law_fits(final_table):
     return final_table
 
 
+
+def add_all_central_ionization_types(final_table):
+    """
+    Calculates and adds SII, NII, and the combined dominant central 
+    ionisation types for the central 5x5 pixels in a single pass.
+    """
+    sii_results = []
+    nii_results = []
+    combined_results = []
+
+    for plateifu in final_table['plateifu']:
+        plate, ifu = plateifu.split("-")
+        
+        # 1. Get both classifications
+        sii_type = categorise_central_ionization_type_SII(plate, ifu)
+        nii_type = categorise_central_ionization_type_NII(plate, ifu)
+        
+        sii_results.append(sii_type)
+        nii_results.append(nii_type)
+ 
+
+        # 2. Determine combined classification based on your logic
+        combined_type = 'Little Ionisation' # Default fallback
+        
+        if nii_type == 'SF':
+            if sii_type in ['SF', 'Optical AGN', 'LI(N)ER']:
+                combined_type = 'SF'
+                
+        elif nii_type == 'Optical AGN':
+            if sii_type == 'SF':
+                combined_type = 'SF'
+            elif sii_type == 'Optical AGN':
+                combined_type = 'Optical AGN'
+            elif sii_type == 'LI(N)ER':
+                combined_type = 'LI(N)ER'
+                
+        combined_results.append(combined_type)
+
+    # 3. Assign all lists to the table columns at once (fixes the == bug and is much faster)
+    final_table['central_ionisation_type_SII'] = sii_results
+    final_table['central_ionisation_type_NII'] = nii_results
+    final_table['central_ionisation_type'] = combined_results
+
+    return final_table
+
+
+
 def match_manga_to_radio():
     max_sep = 3.0 * u.arcsec
 
@@ -207,7 +256,17 @@ def match_manga_to_radio():
     print("Rows:", len(final_table))
     print("Columns:", len(final_table.colnames))
 
+    # =====================================================
+    # Add Power Law Fits
+    # =====================================================
+    
     final_table = add_power_law_fits(final_table)
+
+    # =====================================================
+    # Add Dominant Central ionisation Type
+    # =====================================================
+
+    final_table = add_all_central_ionization_types(final_table)
 
     # =====================================================
     # Save output
@@ -408,10 +467,9 @@ def add_source_ellipse(target_info,survey_config,survey,map_wcs,pixscale,ax):
 
 
 def prepare_and_plot_map(target_info, fig, subplot_number, property_hdu_ext=None, property_channel=None,
-                        is_gline_sigma=None, draw_scalebar=False):
+                         is_gline_sigma=None, draw_scalebar=False):
 
     ### METADATA ###
-
     plate = target_info['plate']
     ifu = target_info['ifu']
     fov = target_info['fov']
@@ -451,14 +509,26 @@ def prepare_and_plot_map(target_info, fig, subplot_number, property_hdu_ext=None
     scale_bar_text_offset = 0.02  
 
     ### PLOT MAP###
-
     map_file_dir = find_map_file(map_dir, plate, ifu)
-    map, map_wcs, map_shape = load_fits_data_map(map_file_dir,property_hdu_ext,property_channel)
+    
+    # ------------------------------------------------------------------
+    # DATA LOADING AND S/N CUTS
+    # ------------------------------------------------------------------
+    with np.errstate(invalid='ignore', divide='ignore'):
+        map_data, map_wcs, map_shape = load_fits_data_map(map_file_dir, property_hdu_ext, property_channel)
 
-    bitmask, _, __ = load_fits_data_map(map_file_dir,property_hdu_ext+2,property_channel)
-    map = np.where(bitmask == 0, map, np.nan)
+        if map_data is None:
+            return None
+        
+        ivar, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+1, property_channel)
+        bitmask, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+2, property_channel)
+        
+        # We use np.abs() here so that negative velocities aren't masked out due to a "negative" SNR
+        snr = np.abs(map_data) * np.sqrt(ivar)
+        
+        map_data = np.where((bitmask == 0) & (snr > 2), map_data, np.nan)
 
-    if map is None:
+    if map_data is None:
         print("Skipping; Galaxy MAP not found")
         return None
 
@@ -470,8 +540,8 @@ def prepare_and_plot_map(target_info, fig, subplot_number, property_hdu_ext=None
             print("Skipping; Galaxy MAP not found")
             return None
         
-        variance_diff = map**2 - instsigma_map**2
-        map = np.sqrt(np.clip(variance_diff, 0, None))
+        variance_diff = map_data**2 - instsigma_map**2
+        map_data = np.sqrt(np.clip(variance_diff, 0, None))
 
     if map_wcs is None:
         print(f"  Skipping: Galaxy (WCS) not found")
@@ -493,15 +563,21 @@ def prepare_and_plot_map(target_info, fig, subplot_number, property_hdu_ext=None
         y_min = max(0, int(center_y - half_size))
         y_max = min(map_height, int(center_y + half_size))
         
-        map = map[y_min:y_max, x_min:x_max]
+        map_data = map_data[y_min:y_max, x_min:x_max]
         map_wcs.wcs.crpix[0] -= x_min
         map_wcs.wcs.crpix[1] -= y_min
     
-    map_height, map_width = map_shape
+    map_height, map_width = map_data.shape 
     ax = fig.add_subplot(subplot_number, projection=map_wcs)
 
-    finite_map = map[np.isfinite(map)]
+    finite_map = map_data[np.isfinite(map_data)]
     nonzero_vals = finite_map[finite_map != 0]
+    
+    if len(nonzero_vals) == 0:
+        print("Skipping; Map empty after masking.")
+        ax.axis('off')
+        return None
+
     ratio = np.nanmax(finite_map) / np.nanmin(nonzero_vals)
     
     # ==========================================
@@ -509,33 +585,35 @@ def prepare_and_plot_map(target_info, fig, subplot_number, property_hdu_ext=None
     # ==========================================
     if property_hdu_ext != 37:
         if ratio > 10:
-            im = ax.imshow(np.log10(map), cmap=cmap, origin='lower')
+            log_data = np.log10(map_data)
+            im = ax.imshow(log_data, cmap=cmap, origin='lower')
             log_scale = True
             
-            if property_hdu_ext == 30: 
-                im.set_clim(0, 2)
-            elif property_hdu_ext == 40: 
-                im.set_clim(1, 3)
+            valid_log_data = log_data[np.isfinite(log_data)]
+            
+            if len(valid_log_data) > 0:
+                vmin = np.percentile(valid_log_data, 3)  
+                vmax = np.percentile(valid_log_data, 99) 
+                
+                if property_hdu_ext == 30: 
+                    im.set_clim(vmin, vmax)
+                elif property_hdu_ext == 40: 
+                    im.set_clim(max(vmin, 1.0), vmax)
         else:
-            im = ax.imshow(map, cmap=cmap, origin='lower')
+            im = ax.imshow(map_data, cmap=cmap, origin='lower')
             log_scale = False
     else:   
-        # Calculate dynamic symmetric limits using the 98th percentile to ignore extreme noise outliers
-        finite_vels = map[np.isfinite(map)]
-        if len(finite_vels) > 0:
-            v_limit = np.percentile(np.abs(finite_vels), 98)
-            v_limit = max(v_limit, 50) # Set a floor so face-on galaxies don't look like static noise
+        if len(finite_map) > 0:
+            v_limit = np.percentile(np.abs(finite_map), 98)
+            v_limit = max(v_limit, 50) 
         else:
-            v_limit = 350 # Fallback
+            v_limit = 350 
             
-        # We adjust linthresh dynamically so it doesn't break if v_limit is very small
         lin_thresh = min(150, v_limit * 0.5)
         norm = SymLogNorm(linthresh=lin_thresh, vmin=-v_limit, vmax=v_limit, base=10)
         
-        im = ax.imshow(map, cmap=cmap, origin='lower', norm=norm)
+        im = ax.imshow(map_data, cmap=cmap, origin='lower', norm=norm)
         log_scale = False
-        
-        # Store v_limit as an attribute on the axis so we can use it for the ticks below!
         ax.v_limit = v_limit 
 
     # ==========================================
@@ -567,24 +645,26 @@ def prepare_and_plot_map(target_info, fig, subplot_number, property_hdu_ext=None
     # ==========================================
     # Custom Ticks Formatting
     # ==========================================
-    if log_scale:
-        if property_hdu_ext == 30: 
-            cbar.set_ticks([0, 1, 2])
-            cbar.set_ticklabels(["0", "1", "2"])
-        elif property_hdu_ext == 40: 
-            cbar.set_ticks([1, 2, 3])
-            cbar.set_ticklabels(["1", "2", "3"])
-            
-    elif property_hdu_ext == 37: 
-        # Dynamically generate round tick numbers based on the limit we just calculated
+    if property_hdu_ext == 37: 
+        # Velocity maps
         v_limit = getattr(ax, 'v_limit', 350)
+        cbar.ax.set_xlim(-v_limit, v_limit) # Force limits
+        cbar.set_ticks([-v_limit, 0, v_limit])
+        cbar.set_ticklabels([f"-{int(v_limit)}", "0", f"{int(v_limit)}"])
         
-        # Pick a nice round number slightly inside the absolute limit
-        tick_val = int(np.round(v_limit * 0.85 / 50.0)) * 50 
-        if tick_val < 50: tick_val = int(v_limit * 0.85) # Fallback if it's super small
+    else:
+        # Flux and Sigma maps
+        vmin, vmax = im.get_clim()
+        vcenter = (vmin + vmax) / 2.0
         
-        cbar.set_ticks([-tick_val, 0, tick_val])
-        cbar.set_ticklabels([f"-{tick_val}", "0", f"{tick_val}"])
+        cbar.ax.set_xlim(vmin, vmax) # Prevent edge clipping
+        cbar.set_ticks([vmin, vcenter, vmax]) # Force exactly 3 ticks
+        
+        def fmt(val):
+            rounded = round(val, 1)
+            return f"{int(rounded)}" if rounded == int(rounded) else f"{rounded:.1f}"
+            
+        cbar.set_ticklabels([fmt(vmin), fmt(vcenter), fmt(vmax)])
 
     cbar.ax.tick_params(labelsize=20, colors='black', length=3, pad=1)
     
@@ -694,43 +774,82 @@ def prepare_and_plot_map(target_info, fig, subplot_number, property_hdu_ext=None
     return im
 
 
+def SII_BPT_diagnostic(map_log_SII_Ha, map_log_OIII_Hb, plate, ifu):
 
-def SII_BPT_diagnostic(log_SII_Ha, log_OIII_Hb):
-    # Ensure inputs are numpy arrays so we can perform element-wise operations
-    x = np.asarray(log_SII_Ha)
-    y = np.asarray(log_OIII_Hb)
+    ew_hdu_ext = 33
+    Ha_channel = 23
+
+
+    map_file_dir = find_map_file(map_dir, plate, ifu)
+
+    # Load EW map. We SKIP applying the bitmask here because EW masks often flag 
+    # the continuum inappropriately. The flux S/N cuts above already handle the bad spaxels!
+    map_Ha_ew, map_wcs, map_shape = load_fits_data_map(map_file_dir, ew_hdu_ext, Ha_channel)
+    
+    # Ensure inputs are numpy arrays
+    x = np.asarray(map_log_SII_Ha)
+    y = np.asarray(map_log_OIII_Hb)
+    ew = np.asarray(map_Ha_ew)
+    
+    # Only evaluate spaxels that survived the Flux S/N cuts
+    valid = ~np.isnan(x) & ~np.isnan(y) & ~np.isnan(ew)
     
     # Suppress divide-by-zero warnings for values where x >= 0.32
     with np.errstate(divide='ignore', invalid='ignore'):
         kewley_limit = (0.72 / (x - 0.32)) + 1.30
         
-    # 1. Star-Forming condition
-    cond_sf = (x < 0.32) & (y < kewley_limit)
+    # Using <= 3 so if it magically lands perfectly on 3.0, it doesn't get dropped
+    cond_lier = valid & (ew <= 3)
+    cond_sf = valid & (ew > 3) & (x < 0.32) & (y < kewley_limit)
+    cond_agn = valid & (ew > 3) & (~cond_sf) & (y > (1.89 * x + 0.76))
+    cond_true_liner = valid & (ew > 3) & (~cond_sf) & (y <= (1.89 * x + 0.76))
     
-    # 2. AGN (Seyfert) condition 
-    # (Must be above the LINER line AND not already classified as SF)
-    cond_agn = (~cond_sf) & (y > (1.89 * x + 0.76))
-    
-    # 3. LINER condition 
-    # (Must be below or on the AGN line AND not already classified as SF)
-    cond_liner = (~cond_sf) & (y <= (1.89 * x + 0.76))
-    
-    # Initialize an array of np.nan. 
-    # Using dtype=object ensures np.nan stays a float instead of becoming the string "nan".
     result = np.full(x.shape, np.nan, dtype=object)
     
-    # Apply conditions to change values
     result[cond_sf] = "SF"
     result[cond_agn] = "AGN"
-    result[cond_liner] = "LINER"
+    result[cond_lier | cond_true_liner] = "LI(N)ER"
     
     return result
 
 
-def prepare_and_plot_resolved_bpt_map(target_info, fig, subplot_number,
-                        draw_scalebar=False):
+def NII_BPT_diagnostic_kewley(map_log_NII_Ha, map_log_OIII_Hb):
+    """
+    Classifies spaxels as Star-Forming (SF) or Active Galactic Nucleus (AGN) 
+    using the strict Kewley et al. (2001) maximum starburst line.
+    """
     
+    # Ensure inputs are numpy arrays
+    x = np.asarray(map_log_NII_Ha)
+    y = np.asarray(map_log_OIII_Hb)
+    
+    # Only evaluate spaxels that have valid flux ratios
+    valid = ~np.isnan(x) & ~np.isnan(y)
+    
+    # Suppress divide-by-zero warnings for values where x >= 0.47 (the asymptote)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        kewley_limit = (0.61 / (x - 0.47)) + 1.19
+        
+    # Kewley et al. (2001) Conditions:
+    # SF: Must be below the asymptote (x < 0.47) AND below the Kewley curve
+    cond_sf = valid & (x < 0.47) & (y < kewley_limit)
+    
+    # AGN: Anything that is valid but NOT classified as SF falls into the AGN region
+    # (This inherently includes all spaxels where x >= 0.47)
+    cond_agn = valid & (~cond_sf)
+    
+    # Initialize result array with NaNs
+    result = np.full(x.shape, np.nan, dtype=object)
+    
+    # Apply classifications
+    result[cond_sf] = "SF"
+    result[cond_agn] = "AGN"
+    
+    return result
 
+
+def prepare_and_plot_resolved_bpt_map(target_info, fig, subplot_number, draw_scalebar=False):
+    
     property_hdu_ext = 30 # EMLINE GFLUX
 
     Ha_channel = 23
@@ -740,7 +859,6 @@ def prepare_and_plot_resolved_bpt_map(target_info, fig, subplot_number,
     SII_6732_channel = 26
 
     ### METADATA ###
-
     plate = target_info['plate']
     ifu = target_info['ifu']
     fov = target_info['fov']
@@ -768,44 +886,71 @@ def prepare_and_plot_resolved_bpt_map(target_info, fig, subplot_number,
     contour_outline_color = "black"  
 
     scale_bar_arcsec = 10.0  
-    scale_bar_margin_x = 0.05  # Margin from the left
-    scale_bar_margin_y = 0.89 # Margin from the bottom 
+    scale_bar_margin_x = 0.05  
+    scale_bar_margin_y = 0.89  
     scale_bar_linewidth = 4  
     scale_bar_fontsize = 15  
     scale_bar_text_offset = 0.02  
 
     ### PLOT MAP###
-
     map_file_dir = find_map_file(map_dir, plate, ifu)
 
-    map_Ha, map_wcs, map_shape = load_fits_data_map(map_file_dir,property_hdu_ext,Ha_channel)
-    bitmask_Ha, _, __ = load_fits_data_map(map_file_dir,property_hdu_ext+2,Ha_channel)
-    map_Ha = np.where(bitmask_Ha == 0, map_Ha, np.nan)
 
-    map_Hb, map_wcs, map_shape = load_fits_data_map(map_file_dir,property_hdu_ext,Hb_channel)
-    bitmask_Hb, _, __ = load_fits_data_map(map_file_dir,property_hdu_ext+2,Hb_channel)
-    map_Hb = np.where(bitmask_Hb == 0, map_Hb, np.nan)
+    # ------------------------------------------------------------------
+    # DATA LOADING AND S/N CUTS
+    # ------------------------------------------------------------------
+    # Suppress warnings for sqrt of negative ivars in bad spaxels
+    with np.errstate(invalid='ignore', divide='ignore'):
+        
+        # Strong lines: Keep S/N > 2
+        map_Ha, map_wcs, map_shape = load_fits_data_map(map_file_dir, property_hdu_ext, Ha_channel)
 
-    map_SII_6718, map_wcs, map_shape = load_fits_data_map(map_file_dir,property_hdu_ext,SII_6718_channel)
-    bitmask_SII_6718, _, __ = load_fits_data_map(map_file_dir,property_hdu_ext+2,SII_6718_channel)
-    map_SII_6718 = np.where(bitmask_SII_6718 == 0, map_SII_6718, np.nan)
+        if map_Ha is None:
+            return None
+        
+        ivar_Ha, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+1, Ha_channel)
+        bitmask_Ha, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+2, Ha_channel)
+        snr_Ha = np.abs(map_Ha) * np.sqrt(ivar_Ha)
+        map_Ha = np.where((bitmask_Ha == 0) & (snr_Ha > 2), map_Ha, np.nan)
 
-    map_SII_6732, map_wcs, map_shape = load_fits_data_map(map_file_dir,property_hdu_ext,SII_6732_channel)
-    bitmask_SII_6732, _, __ = load_fits_data_map(map_file_dir,property_hdu_ext+2,SII_6732_channel)
-    # Fixed bug: was previously assigning map_SII_6718 here
-    map_SII_6732 = np.where(bitmask_SII_6732 == 0, map_SII_6732, np.nan) 
+        map_OIII, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext, OIII_channel)
+        ivar_OIII, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+1, OIII_channel)
+        bitmask_OIII, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+2, OIII_channel)
+        snr_OIII = np.abs(map_OIII) * np.sqrt(ivar_OIII)
+        map_OIII = np.where((bitmask_OIII == 0) & (snr_OIII > 2), map_OIII, np.nan)
 
-    map_SII = map_SII_6732 + map_SII_6718
+        # Weak lines: Relax S/N to > 1.5 to preserve the core
+        map_Hb, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext, Hb_channel)
+        ivar_Hb, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+1, Hb_channel)
+        bitmask_Hb, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+2, Hb_channel)
+        snr_Hb = np.abs(map_Hb) * np.sqrt(ivar_Hb)
+        map_Hb = np.where((bitmask_Hb == 0) & (snr_Hb > 2), map_Hb, np.nan)
 
-    map_OIII, map_wcs, map_shape = load_fits_data_map(map_file_dir,property_hdu_ext,OIII_channel)
-    bitmask_OIII, _, __ = load_fits_data_map(map_file_dir,property_hdu_ext+2,OIII_channel)
-    map_OIII = np.where(bitmask_OIII == 0, map_OIII, np.nan)
+        # [SII] Doublet: Combine fluxes AND variances first, then apply S/N cut!
+        map_SII_6718, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext, SII_6718_channel)
+        ivar_SII_6718, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+1, SII_6718_channel)
+        bitmask_SII_6718, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+2, SII_6718_channel)
+        
+        map_SII_6732, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext, SII_6732_channel)
+        ivar_SII_6732, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+1, SII_6732_channel)
+        bitmask_SII_6732, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+2, SII_6732_channel)
+        
+        map_SII_sum = map_SII_6732 + map_SII_6718
+        # Variance adds together: var_sum = var1 + var2 --> 1/ivar_sum = 1/ivar1 + 1/ivar2
+        ivar_SII_sum = 1.0 / (1.0/ivar_SII_6732 + 1.0/ivar_SII_6718)
+        snr_SII_sum = np.abs(map_SII_sum) * np.sqrt(ivar_SII_sum)
+        
+        valid_SII = (bitmask_SII_6718 == 0) & (bitmask_SII_6732 == 0) & (snr_SII_sum > 2)
+        map_SII = np.where(valid_SII, map_SII_sum, np.nan)
+
+    # ------------------------------------------------------------------
+    # MAP CALCULATIONS
+    # ------------------------------------------------------------------
 
     map_log_SII_Ha = np.log10(map_SII/map_Ha)
     map_log_OIII_Hb = np.log10(map_OIII/map_Hb)
 
-    # Renamed variable to avoid shadowing built-in python 'map'
-    bpt_map = SII_BPT_diagnostic(map_log_SII_Ha, map_log_OIII_Hb)
+    bpt_map = SII_BPT_diagnostic(map_log_SII_Ha, map_log_OIII_Hb, target_info)
 
     if bpt_map is None:
         print("Skipping; Galaxy MAP not found")
@@ -837,7 +982,7 @@ def prepare_and_plot_resolved_bpt_map(target_info, fig, subplot_number,
         map_wcs.wcs.crpix[1] -= y_min
 
     # 2. Convert to numeric array safely AFTER cropping
-    categories = ['SF', 'AGN', 'LINER'] # Adjust 'LINER' or 'LI(N)ER' to match exactly what your BPT func outputs
+    categories = ['SF', 'AGN', 'LI(N)ER'] 
     mapping = {cat: i for i, cat in enumerate(categories)}
     
     numeric_data = np.full(bpt_map.shape, np.nan, dtype=float)
@@ -845,13 +990,13 @@ def prepare_and_plot_resolved_bpt_map(target_info, fig, subplot_number,
         numeric_data[bpt_map == category] = num_val
 
     # 3. Setup Plotting
-    colors = ['#1f77b4', '#d62728', '#2ca02c']  # Blue, Red, Green
+    colors = ['#1f77b4', '#d62728', '#2ca02c']  
     cmap = ListedColormap(colors)
 
     ax = fig.add_subplot(subplot_number, projection=map_wcs)
     im = ax.imshow(numeric_data, cmap=cmap, vmin=-0.5, vmax=len(categories)-0.5)
 
-    # 4. Add Legend (Replacing Colorbar)
+    # 4. Add Legend 
     legend_elements = [
         Line2D([0], [0], marker='o', color='w', label='SF', 
                markerfacecolor=colors[0], markersize=15),
@@ -861,9 +1006,7 @@ def prepare_and_plot_resolved_bpt_map(target_info, fig, subplot_number,
                markerfacecolor=colors[2], markersize=15)
     ]
     
-    # Legend reverted to a single column to stack vertically
     ax.legend(handles=legend_elements, loc='upper right', framealpha=0, fontsize=15)
-
 
     # ==========================================
     # Contours
@@ -929,7 +1072,6 @@ def prepare_and_plot_resolved_bpt_map(target_info, fig, subplot_number,
         except:
             pixscale = np.abs(map_wcs.wcs.cdelt[0]) * 3600.0
         
-        # Ensure we use bpt_map.shape width instead of the old un-cropped map_width
         map_h, map_w = bpt_map.shape
         scale_pixels = sb_arcsec / pixscale
         scale_rel = scale_pixels / map_w
@@ -966,6 +1108,7 @@ def prepare_and_plot_resolved_bpt_map(target_info, fig, subplot_number,
     ax.spines['left'].set_visible(False)
     
     return im
+
 
 def prepare_and_plot_cutout(target_info, fov, fig, subplot_number):
 
@@ -1453,31 +1596,34 @@ def plot_cutout_BPT_Ha_O3_O3kinematics_rcontour(target_info):
     # CANVAS SETUP
     # ==========================================
     fig_width = 8.0  
-    fig_height = 12.0  # Set to exactly 12.0 so 3 rows of squares fit perfectly (4.0 x 3 = 12.0)
+    fig_height = 12.0  
     dpi = 400  
 
     fig = plt.figure(figsize=(fig_width, fig_height), dpi=dpi)
-    
-    # Removed all margins
     fig.subplots_adjust(left=0.0, right=1.0, bottom=0.0, top=1.0, wspace=0.0, hspace=0.0)
 
     # ==========================================
     # Panel 1 (321): 3 arcmin cutout + Info Overlay
     # ==========================================
-    prepare_and_plot_cutout(target_info, 3, fig, 321)
-    ax1 = fig.axes[0]
+    n_axes_before = len(fig.axes)
+    res1 = prepare_and_plot_cutout(target_info, 3, fig, 321)
+    ax1 = fig.axes[-1] if len(fig.axes) > n_axes_before else fig.add_subplot(321)
     
-    ax1.margins(0)             
-    
-    if hasattr(ax1, 'coords'):
-        for coord in ax1.coords:
-            coord.set_ticks_visible(False)
-            coord.set_ticklabel_visible(False)
+    if not res1:
+        ax1.axis('off')
+        text_color_ax1 = 'black' # Change to black so it's visible on empty white panel
     else:
-        ax1.set_xticks([])
-        ax1.set_yticks([])
-        ax1.tick_params(axis='x', bottom=False, top=False, labelbottom=False)
-        ax1.tick_params(axis='y', left=False, right=False, labelleft=False)
+        ax1.margins(0)             
+        text_color_ax1 = 'white'
+        if hasattr(ax1, 'coords'):
+            for coord in ax1.coords:
+                coord.set_ticks_visible(False)
+                coord.set_ticklabel_visible(False)
+        else:
+            ax1.set_xticks([])
+            ax1.set_yticks([])
+            ax1.tick_params(axis='x', bottom=False, top=False, labelbottom=False)
+            ax1.tick_params(axis='y', left=False, right=False, labelleft=False)
 
     info_overlay_text_ax1 = (
         f"z: {z:.4f}\n"
@@ -1485,44 +1631,38 @@ def plot_cutout_BPT_Ha_O3_O3kinematics_rcontour(target_info):
         r"$\mathbf{log \left( SFR \right)}$: " + f"{log_sfr:.2f}"
     )
 
-    ax1.text(0.05, 0.95, info_overlay_text_ax1, color='white', fontsize=20, 
+    ax1.text(0.05, 0.95, info_overlay_text_ax1, color=text_color_ax1, fontsize=20, 
              verticalalignment='top', horizontalalignment='left', 
              transform=ax1.transAxes, fontweight='bold')
 
     # ==========================================
     # Panel 2 (322): Resolved BPT Map + Stats + MaNGA ID
     # ==========================================
-    n_axes = len(fig.axes)
-    prepare_and_plot_resolved_bpt_map(target_info, fig, 322, draw_scalebar=False)
-    ax2 = fig.axes[n_axes]
+    n_axes_before = len(fig.axes)
+    res2 = prepare_and_plot_resolved_bpt_map(target_info, fig, 322, draw_scalebar=False)
+    ax2 = fig.axes[-1] if len(fig.axes) > n_axes_before else fig.add_subplot(322)
     
-    lines = []
+    if not res2:
+        ax2.axis('off')
 
-    # 1. AGN Status
+    lines = []
     if is_detected_agn:
-        # \mathbf requires spaces to be escaped or explicitly typed in math mode
         lines.append(r"$\mathbf{Is\ Detected\ AGN}$")
 
-    # 2. Slope (Alpha)
     if has_all_three_matches:
         lines.append(rf"$\boldsymbol{{\alpha}}$: $\mathbf{{{power_law_slope:.2f}}}$")
     elif spectral_slope is not None:
         lines.append(rf"$\boldsymbol{{\alpha}}$: $\mathbf{{{spectral_slope:.2f}}}$")
 
-    # 3. Chi-Squared
     if has_all_three_matches:
         lines.append(rf"$\boldsymbol{{\chi^2}}$: $\mathbf{{{power_law_ch2:.2f}}}$")
 
-    # Combine everything with newlines. 
-    # If a condition isn't met, it simply won't add an empty line.
     info_overlay_text_ax2 = "\n".join(lines)
 
-    # Top Left Stats (Changed to white for visibility over the map)
     ax2.text(0.05, 0.95, info_overlay_text_ax2, color='black', fontsize=20, 
              verticalalignment='top', horizontalalignment='left', 
              transform=ax2.transAxes, fontweight='bold')
 
-    # Bottom Right MaNGA ID (Changed to white for visibility over the map)
     ax2.text(0.98, 0.02, f"MaNGA ID: {mangaid}", color='black', fontsize=20, 
              verticalalignment='bottom', horizontalalignment='right', 
              transform=ax2.transAxes, fontweight='bold')
@@ -1530,21 +1670,29 @@ def plot_cutout_BPT_Ha_O3_O3kinematics_rcontour(target_info):
     # ==========================================
     # PANELS 3-6: Maps
     # ==========================================
-    n_axes = len(fig.axes)
-    prepare_and_plot_map(target_info, fig, 323, emline_gflux_hdu_ext, Ha_channel)
-    ax3 = fig.axes[n_axes]
+    # Panel 3
+    n_axes_before = len(fig.axes)
+    res3 = prepare_and_plot_map(target_info, fig, 323, emline_gflux_hdu_ext, Ha_channel)
+    ax3 = fig.axes[-1] if len(fig.axes) > n_axes_before else fig.add_subplot(323)
+    if not res3: ax3.axis('off')
 
-    n_axes = len(fig.axes)
-    prepare_and_plot_map(target_info, fig, 324, emline_gflux_hdu_ext, O3_channel)
-    ax4 = fig.axes[n_axes]
+    # Panel 4
+    n_axes_before = len(fig.axes)
+    res4 = prepare_and_plot_map(target_info, fig, 324, emline_gflux_hdu_ext, O3_channel)
+    ax4 = fig.axes[-1] if len(fig.axes) > n_axes_before else fig.add_subplot(324)
+    if not res4: ax4.axis('off')
 
-    n_axes = len(fig.axes)
-    prepare_and_plot_map(target_info, fig, 325, emline_gvel_hdu_ext, O3_channel, draw_scalebar=True)
-    ax5 = fig.axes[n_axes]
+    # Panel 5
+    n_axes_before = len(fig.axes)
+    res5 = prepare_and_plot_map(target_info, fig, 325, emline_gvel_hdu_ext, O3_channel, draw_scalebar=True)
+    ax5 = fig.axes[-1] if len(fig.axes) > n_axes_before else fig.add_subplot(325)
+    if not res5: ax5.axis('off')
 
-    n_axes = len(fig.axes)
-    prepare_and_plot_map(target_info, fig, 326, emline_gsigma_hdu_ext, O3_channel)
-    ax6 = fig.axes[n_axes]
+    # Panel 6
+    n_axes_before = len(fig.axes)
+    res6 = prepare_and_plot_map(target_info, fig, 326, emline_gsigma_hdu_ext, O3_channel)
+    ax6 = fig.axes[-1] if len(fig.axes) > n_axes_before else fig.add_subplot(326)
+    if not res6: ax6.axis('off')
 
     # ==========================================
     # THE ALIGNMENT FIX (PERFECT LEGO SNAP)
@@ -1559,8 +1707,6 @@ def plot_cutout_BPT_Ha_O3_O3kinematics_rcontour(target_info):
     
     x_left = 0.5 - col_w
     x_right = 0.5
-    
-    # Start exactly at the bottom edge
     y_start = 0.0 
     
     # Bottom Row
@@ -1578,13 +1724,12 @@ def plot_cutout_BPT_Ha_O3_O3kinematics_rcontour(target_info):
     # ==========================================
     # PANEL-SPECIFIC MATCH LEGENDS 
     # ==========================================
-    
     has_lofar = target_info.get('is_lotss_match', False)  
     has_first = target_info.get('is_first_match', False)
     has_vlass = target_info.get('is_vlass_match', False)
 
-    # Panel 3 (ax3): LoTSS
-    if has_lofar:
+    # Panel 3 (ax3): LoTSS (Only plot if map exists)
+    if has_lofar and res3:
         color = "#FE4203"
         line = [Line2D([0], [0], color=color, lw=2, label="LoTSS 144 MHz", alpha=0.8)]
         leg = ax3.legend(handles=line, loc='upper left', fontsize=20, frameon=False, borderaxespad=0.05, borderpad=0.05)
@@ -1592,8 +1737,8 @@ def plot_cutout_BPT_Ha_O3_O3kinematics_rcontour(target_info):
             text.set_color(color)
             text.set_weight("bold")
 
-    # Panel 4 (ax4): FIRST
-    if has_first:
+    # Panel 4 (ax4): FIRST (Only plot if map exists)
+    if has_first and res4:
         color = "#A671F7"
         line = [Line2D([0], [0], color=color, lw=2, label="FIRST 1.4 GHz", alpha=0.8)]
         leg = ax4.legend(handles=line, loc='upper left', fontsize=20, frameon=False, borderaxespad=0.05, borderpad=0.05)
@@ -1601,8 +1746,8 @@ def plot_cutout_BPT_Ha_O3_O3kinematics_rcontour(target_info):
             text.set_color(color)
             text.set_weight("bold")
 
-    # Panel 6 (ax6): VLASS
-    if has_vlass:
+    # Panel 6 (ax6): VLASS (Only plot if map exists)
+    if has_vlass and res6:
         color = "#FFCC00"
         line = [Line2D([0], [0], color=color, lw=2, label="VLASS 3 GHz", alpha=0.8)]
         leg = ax6.legend(handles=line, loc='upper left', fontsize=20, frameon=False, borderaxespad=0.05, borderpad=0.05)
@@ -1618,4 +1763,318 @@ def plot_cutout_BPT_Ha_O3_O3kinematics_rcontour(target_info):
     plt.savefig("../manga_rmorph_data/cutout_BPT_Ha_O3_O3kinematics_rcontour/" + mangaid_str + ".png", 
                 facecolor='white', bbox_inches='tight', pad_inches=0)
     
+
     plt.close(fig)
+
+
+
+def categorise_central_ionization_type_SII(plate, ifu):
+
+    property_hdu_ext = 30 # EMLINE GFLUX
+
+    Ha_channel = 23
+    Hb_channel = 14
+    OIII_channel = 16
+
+    NII_6585_channel = 24
+    SII_6718_channel = 25
+    SII_6732_channel = 26
+
+    ### METADATA ###
+
+    fov = 1 #arcmin
+
+    map_file_dir = find_map_file(map_dir, plate, ifu)
+
+    # ------------------------------------------------------------------
+    # DATA LOADING AND S/N CUTS
+    # ------------------------------------------------------------------
+    # Suppress warnings for sqrt of negative ivars in bad spaxels
+    with np.errstate(invalid='ignore', divide='ignore'):
+        
+        # Strong lines: Keep S/N > 2
+        map_Ha, map_wcs, map_shape = load_fits_data_map(map_file_dir, property_hdu_ext, Ha_channel)
+
+        if map_Ha is None:
+            return None
+        
+        ivar_Ha, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+1, Ha_channel)
+        bitmask_Ha, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+2, Ha_channel)
+        snr_Ha = np.abs(map_Ha) * np.sqrt(ivar_Ha)
+        map_Ha = np.where((bitmask_Ha == 0) & (snr_Ha > 2), map_Ha, np.nan)
+
+        map_OIII, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext, OIII_channel)
+        ivar_OIII, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+1, OIII_channel)
+        bitmask_OIII, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+2, OIII_channel)
+        snr_OIII = np.abs(map_OIII) * np.sqrt(ivar_OIII)
+        map_OIII = np.where((bitmask_OIII == 0) & (snr_OIII > 2), map_OIII, np.nan)
+
+        map_NII, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext, NII_6585_channel)
+        ivar_NII, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+1, NII_6585_channel)
+        bitmask_NII, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+2, NII_6585_channel)
+        snr_NII = np.abs(map_NII) * np.sqrt(ivar_NII)
+        map_NII = np.where((bitmask_NII == 0) & (snr_NII > 2), map_NII, np.nan)
+
+        # Weak lines: Relax S/N to > 1.5 to preserve the core
+        map_Hb, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext, Hb_channel)
+        ivar_Hb, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+1, Hb_channel)
+        bitmask_Hb, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+2, Hb_channel)
+        snr_Hb = np.abs(map_Hb) * np.sqrt(ivar_Hb)
+        map_Hb = np.where((bitmask_Hb == 0) & (snr_Hb > 2), map_Hb, np.nan)
+
+        # [SII] Doublet: Combine fluxes AND variances first, then apply S/N cut!
+        map_SII_6718, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext, SII_6718_channel)
+        ivar_SII_6718, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+1, SII_6718_channel)
+        bitmask_SII_6718, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+2, SII_6718_channel)
+        
+        map_SII_6732, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext, SII_6732_channel)
+        ivar_SII_6732, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+1, SII_6732_channel)
+        bitmask_SII_6732, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+2, SII_6732_channel)
+        
+        map_SII_sum = map_SII_6732 + map_SII_6718
+        # Variance adds together: var_sum = var1 + var2 --> 1/ivar_sum = 1/ivar1 + 1/ivar2
+        ivar_SII_sum = 1.0 / (1.0/ivar_SII_6732 + 1.0/ivar_SII_6718)
+        snr_SII_sum = np.abs(map_SII_sum) * np.sqrt(ivar_SII_sum)
+        
+        valid_SII = (bitmask_SII_6718 == 0) & (bitmask_SII_6732 == 0) & (snr_SII_sum > 2)
+        map_SII = np.where(valid_SII, map_SII_sum, np.nan)
+
+    # ------------------------------------------------------------------
+    # MAP CALCULATIONS
+    # ------------------------------------------------------------------
+
+    map_log_SII_Ha = np.log10(map_SII/map_Ha)
+    map_log_OIII_Hb = np.log10(map_OIII/map_Hb)
+
+    bpt_map = SII_BPT_diagnostic(map_log_SII_Ha, map_log_OIII_Hb, plate, ifu)
+
+
+    if bpt_map is None:
+        print("Skipping; Galaxy MAP not found")
+        return None
+
+    if map_wcs is None:
+        print(f"  Skipping: Galaxy (WCS) not found")
+        return None  
+
+    map_height, map_width = map_shape
+    
+    # 1. Apply FOV Crop to the BPT Map first
+    if fov is not None:
+        center_x, center_y = map_width / 2.0, map_height / 2.0
+        try:
+            pixscale = np.abs(map_wcs.pixel_scale_matrix[0, 0]) * 3600.0
+        except:
+            pixscale = np.abs(map_wcs.wcs.cdelt[0]) * 3600.0
+        
+        fov_pixels = int(fov * 60.0 / pixscale)
+        half_size = fov_pixels / 2.0
+        x_min = max(0, int(center_x - half_size))
+        x_max = min(map_width, int(center_x + half_size))
+        y_min = max(0, int(center_y - half_size))
+        y_max = min(map_height, int(center_y + half_size))
+        
+        bpt_map = bpt_map[y_min:y_max, x_min:x_max]
+        map_wcs.wcs.crpix[0] -= x_min
+        map_wcs.wcs.crpix[1] -= y_min
+
+    # 2. Convert to numeric array safely AFTER cropping
+    categories_SII = ['SF', 'AGN', 'LI(N)ER'] 
+    mapping_SII = {cat: i for i, cat in enumerate(categories_SII)}
+    
+    numeric_data_SII = np.full(bpt_map.shape, np.nan, dtype=float)
+    for category, num_val in mapping_SII.items():
+        numeric_data_SII[bpt_map == category] = num_val
+
+
+    H, W = numeric_data_SII.shape
+    center_y, center_x = H // 2, W // 2
+    central_5x5_array = numeric_data_SII[center_y-2 : center_y+3, center_x-2 : center_x+3]
+
+    print(central_5x5_array)
+
+    # 1. Flatten the array so we can easily count the elements
+    flat_array = central_5x5_array.flatten()
+
+    # 2. Convert 'None' to 'np.nan' to ensure they are counted together
+    # and force the array to float so np.isnan() works safely.
+    flat_array = np.where(flat_array == None, np.nan, flat_array)
+    flat_array = np.asarray(flat_array, dtype=float)
+
+    # 3. Get unique values and their frequencies. 
+    # (In numpy >= 1.24, equal_nan=True is the default, grouping all NaNs together)
+    values, counts = np.unique(flat_array, return_counts=True)
+
+    # 4. Find the index of the highest count, and get the corresponding value
+    dominant_index = np.argmax(counts)
+    dominant_value = values[dominant_index]
+
+    # 5. Return the corresponding classification
+    if dominant_value == 0:
+        return "SF"
+    elif dominant_value == 1:
+        return "Optical AGN"
+    elif dominant_value == 2:
+        return "LI(N)ER"
+    elif np.isnan(dominant_value):
+        # This will trigger if np.nan or None is the dominant type
+        return "Little Ionization" 
+    else:
+        # Catch-all for unexpected numbers
+        return "Unknown"
+    
+
+
+
+def categorise_central_ionization_type_NII(plate, ifu):
+
+    property_hdu_ext = 30 # EMLINE GFLUX
+
+    Ha_channel = 23
+    Hb_channel = 14
+    OIII_channel = 16
+
+    NII_6585_channel = 24
+    SII_6718_channel = 25
+    SII_6732_channel = 26
+
+    ### METADATA ###
+
+    fov = 1 #arcmin
+
+    map_file_dir = find_map_file(map_dir, plate, ifu)
+
+    # ------------------------------------------------------------------
+    # DATA LOADING AND S/N CUTS
+    # ------------------------------------------------------------------
+    # Suppress warnings for sqrt of negative ivars in bad spaxels
+    with np.errstate(invalid='ignore', divide='ignore'):
+        
+        # Strong lines: Keep S/N > 2
+        map_Ha, map_wcs, map_shape = load_fits_data_map(map_file_dir, property_hdu_ext, Ha_channel)
+
+        if map_Ha is None:
+            return None
+        
+        ivar_Ha, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+1, Ha_channel)
+        bitmask_Ha, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+2, Ha_channel)
+        snr_Ha = np.abs(map_Ha) * np.sqrt(ivar_Ha)
+        map_Ha = np.where((bitmask_Ha == 0) & (snr_Ha > 2), map_Ha, np.nan)
+
+        map_OIII, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext, OIII_channel)
+        ivar_OIII, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+1, OIII_channel)
+        bitmask_OIII, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+2, OIII_channel)
+        snr_OIII = np.abs(map_OIII) * np.sqrt(ivar_OIII)
+        map_OIII = np.where((bitmask_OIII == 0) & (snr_OIII > 2), map_OIII, np.nan)
+
+        map_NII, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext, NII_6585_channel)
+        ivar_NII, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+1, NII_6585_channel)
+        bitmask_NII, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+2, NII_6585_channel)
+        snr_NII = np.abs(map_NII) * np.sqrt(ivar_NII)
+        map_NII = np.where((bitmask_NII == 0) & (snr_NII > 2), map_NII, np.nan)
+
+        # Weak lines: Relax S/N to > 1.5 to preserve the core
+        map_Hb, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext, Hb_channel)
+        ivar_Hb, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+1, Hb_channel)
+        bitmask_Hb, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+2, Hb_channel)
+        snr_Hb = np.abs(map_Hb) * np.sqrt(ivar_Hb)
+        map_Hb = np.where((bitmask_Hb == 0) & (snr_Hb > 2), map_Hb, np.nan)
+
+        # [SII] Doublet: Combine fluxes AND variances first, then apply S/N cut!
+        map_SII_6718, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext, SII_6718_channel)
+        ivar_SII_6718, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+1, SII_6718_channel)
+        bitmask_SII_6718, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+2, SII_6718_channel)
+        
+        map_SII_6732, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext, SII_6732_channel)
+        ivar_SII_6732, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+1, SII_6732_channel)
+        bitmask_SII_6732, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+2, SII_6732_channel)
+        
+        map_SII_sum = map_SII_6732 + map_SII_6718
+        # Variance adds together: var_sum = var1 + var2 --> 1/ivar_sum = 1/ivar1 + 1/ivar2
+        ivar_SII_sum = 1.0 / (1.0/ivar_SII_6732 + 1.0/ivar_SII_6718)
+        snr_SII_sum = np.abs(map_SII_sum) * np.sqrt(ivar_SII_sum)
+        
+        valid_SII = (bitmask_SII_6718 == 0) & (bitmask_SII_6732 == 0) & (snr_SII_sum > 2)
+        map_SII = np.where(valid_SII, map_SII_sum, np.nan)
+
+    # ------------------------------------------------------------------
+    # MAP CALCULATIONS
+    # ------------------------------------------------------------------
+
+    map_log_NII_Ha = np.log10(map_NII/map_Ha)
+    map_log_OIII_Hb = np.log10(map_OIII/map_Hb)
+
+    bpt_map = NII_BPT_diagnostic_kewley(map_log_NII_Ha, map_log_OIII_Hb)
+
+
+    if bpt_map is None:
+        print("Skipping; Galaxy MAP not found")
+        return None
+
+    if map_wcs is None:
+        print(f"  Skipping: Galaxy (WCS) not found")
+        return None  
+
+    map_height, map_width = map_shape
+    
+    # 1. Apply FOV Crop to the BPT Map first
+    if fov is not None:
+        center_x, center_y = map_width / 2.0, map_height / 2.0
+        try:
+            pixscale = np.abs(map_wcs.pixel_scale_matrix[0, 0]) * 3600.0
+        except:
+            pixscale = np.abs(map_wcs.wcs.cdelt[0]) * 3600.0
+        
+        fov_pixels = int(fov * 60.0 / pixscale)
+        half_size = fov_pixels / 2.0
+        x_min = max(0, int(center_x - half_size))
+        x_max = min(map_width, int(center_x + half_size))
+        y_min = max(0, int(center_y - half_size))
+        y_max = min(map_height, int(center_y + half_size))
+        
+        bpt_map = bpt_map[y_min:y_max, x_min:x_max]
+        map_wcs.wcs.crpix[0] -= x_min
+        map_wcs.wcs.crpix[1] -= y_min
+
+    # 2. Convert to numeric array safely AFTER cropping
+    categories_NII = ['SF', 'AGN'] 
+    mapping_NII = {cat: i for i, cat in enumerate(categories_NII)}
+    
+    numeric_data_NII = np.full(bpt_map.shape, np.nan, dtype=float)
+    for category, num_val in mapping_NII.items():
+        numeric_data_NII[bpt_map == category] = num_val
+
+
+    H, W = numeric_data_NII.shape
+    center_y, center_x = H // 2, W // 2
+    central_5x5_array = numeric_data_NII[center_y-2 : center_y+3, center_x-2 : center_x+3]
+
+    # 1. Flatten the array so we can easily count the elements
+    flat_array = central_5x5_array.flatten()
+
+    # 2. Convert 'None' to 'np.nan' to ensure they are counted together
+    # and force the array to float so np.isnan() works safely.
+    flat_array = np.where(flat_array == None, np.nan, flat_array)
+    flat_array = np.asarray(flat_array, dtype=float)
+
+    # 3. Get unique values and their frequencies. 
+    # (In numpy >= 1.24, equal_nan=True is the default, grouping all NaNs together)
+    values, counts = np.unique(flat_array, return_counts=True)
+
+    # 4. Find the index of the highest count, and get the corresponding value
+    dominant_index = np.argmax(counts)
+    dominant_value = values[dominant_index]
+
+    # 5. Return the corresponding classification
+    if dominant_value == 0:
+        return "SF"
+    elif dominant_value == 1:
+        return "Optical AGN"
+
+    elif np.isnan(dominant_value):
+        # This will trigger if np.nan or None is the dominant type
+        return "Little Ionization" 
+    
+    else:
+        # Catch-all for unexpected numbers
+        return "Unknown"

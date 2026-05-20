@@ -20,7 +20,15 @@ data_final = fits.open(path_data_final)[1].data
 manga_targets = funcs.get_target_info(data_final)
 
 print(len(manga_targets))
+n = 0
 
 for i in range(len(manga_targets)):
 
     funcs.plot_cutout_BPT_Ha_O3_O3kinematics_rcontour(manga_targets[i])
+    
+
+
+print("Total cutouts plotted: ", n)
+
+
+        
