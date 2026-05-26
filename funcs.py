@@ -75,7 +75,70 @@ def process_radio_catalog(catalog_table, prefix, c_manga, max_sep, n_manga, ra_c
 
     return aligned_table
 
+def add_spectral_slopes(final_table):
+    
+    # 1. Define frequencies (in MHz)
+    nu_lotss = 144.0
+    nu_first = 1400.0
+    nu_vlass = 3000.0
 
+    # 2. Pre-calculate the log denominators
+    log_den_144_1400 = np.log10(nu_first / nu_lotss)
+    log_den_1400_3000 = np.log10(nu_vlass / nu_first)
+    log_den_144_3000 = np.log10(nu_vlass / nu_lotss)
+    
+    ln_den_144_1400 = np.log(nu_first / nu_lotss)
+    ln_den_1400_3000 = np.log(nu_vlass / nu_first)
+    ln_den_144_3000 = np.log(nu_vlass / nu_lotss)
+
+    # 3. Column name definitions
+    f_lotss, e_lotss = "lotss_Total_flux", "lotss_E_Total_flux"
+    f_first, e_first = "first_Fint", "first_Rms"
+    f_vlass, e_vlass = "vlass_Total_flux", "vlass_E_Total_flux"
+
+    # 4. Initialize the new columns with NaNs in the Astropy Table
+    final_table['alpha_144_1400'] = np.nan
+    final_table['err_alpha_144_1400'] = np.nan
+    final_table['alpha_1400_3000'] = np.nan
+    final_table['err_alpha_1400_3000'] = np.nan
+    final_table['alpha_144_3000'] = np.nan
+    final_table['err_alpha_144_3000'] = np.nan
+
+    # 5. Create boolean masks for valid matches and strictly positive fluxes
+    valid_lotss = np.array(final_table['is_lotss_match'], dtype=bool) & (final_table[f_lotss] > 0)
+    valid_first = np.array(final_table['is_first_match'], dtype=bool) & (final_table[f_first] > 0)
+    valid_vlass = np.array(final_table['is_vlass_match'], dtype=bool) & (final_table[f_vlass] > 0)
+
+    # 6. Helper function to compute and inject data into the Astropy table
+    def compute_and_assign(f1_col, f2_col, e1_col, e2_col, log_den, ln_den, mask, alpha_col, err_col):
+        if not np.any(mask):
+            return
+
+        f1 = final_table[f1_col][mask]
+        f2 = final_table[f2_col][mask]
+        e1 = final_table[e1_col][mask]
+        e2 = final_table[e2_col][mask]
+        
+        alpha = (np.log10(f2) - np.log10(f1)) / log_den
+        err = (1.0 / np.abs(ln_den)) * np.sqrt((e1 / f1)**2 + (e2 / f2)**2)
+        
+        final_table[alpha_col][mask] = alpha
+        final_table[err_col][mask] = err
+
+    # 7. Apply the calculations
+    mask_144_1400 = valid_lotss & valid_first
+    compute_and_assign(f_lotss, f_first, e_lotss, e_first, log_den_144_1400, ln_den_144_1400, 
+                       mask_144_1400, 'alpha_144_1400', 'err_alpha_144_1400')
+
+    mask_1400_3000 = valid_first & valid_vlass
+    compute_and_assign(f_first, f_vlass, e_first, e_vlass, log_den_1400_3000, ln_den_1400_3000, 
+                       mask_1400_3000, 'alpha_1400_3000', 'err_alpha_1400_3000')
+
+    mask_144_3000 = valid_lotss & valid_vlass
+    compute_and_assign(f_lotss, f_vlass, e_lotss, e_vlass, log_den_144_3000, ln_den_144_3000, 
+                       mask_144_3000, 'alpha_144_3000', 'err_alpha_144_3000')
+
+    return final_table
 
 def add_power_law_fits(final_table):
     """
@@ -152,7 +215,6 @@ def add_power_law_fits(final_table):
     return final_table
 
 
-
 def add_all_central_ionization_types(final_table):
     """
     Calculates and adds SII, NII, and the combined dominant central 
@@ -161,6 +223,24 @@ def add_all_central_ionization_types(final_table):
     sii_results = []
     nii_results = []
     combined_results = []
+
+    # Dictionary mapping (NII type, SII type) -> Final Category
+    category_map = {
+        ('SF', 'SF'): 'SF',
+        ('SF', 'Sy'): 'SF-Sy',
+        ('SF', 'LI(N)ER'): 'SF-LI(N)ER',
+        ('SF', 'Little Ionisation'): 'SF',
+        
+        ('Sy', 'SF'): 'Sy-SF',
+        ('Sy', 'Sy'): 'Sy',
+        ('Sy', 'LI(N)ER'): 'Sy-LI(N)ER',
+        ('Sy', 'Little Ionisation'): 'Sy',
+        
+        ('Little Ionisation', 'SF'): 'SF',
+        ('Little Ionisation', 'Sy'): 'Sy',
+        ('Little Ionisation', 'LI(N)ER'): 'Little-LI(N)ER',
+        ('Little Ionisation', 'Little Ionisation'): 'Little Ionisation'
+    }
 
     for plateifu in final_table['plateifu']:
         plate, ifu = plateifu.split("-")
@@ -172,21 +252,9 @@ def add_all_central_ionization_types(final_table):
         sii_results.append(sii_type)
         nii_results.append(nii_type)
  
-
-        # 2. Determine combined classification based on your logic
-        combined_type = 'Little Ionisation' # Default fallback
-        
-        if nii_type == 'SF':
-            if sii_type in ['SF', 'Optical AGN', 'LI(N)ER']:
-                combined_type = 'SF'
-                
-        elif nii_type == 'Optical AGN':
-            if sii_type == 'SF':
-                combined_type = 'SF'
-            elif sii_type == 'Optical AGN':
-                combined_type = 'Optical AGN'
-            elif sii_type == 'LI(N)ER':
-                combined_type = 'LI(N)ER'
+        # 2. Determine combined classification based on the mapping dictionary.
+        # .get() looks up the tuple. If an unexpected combination pops up, it falls back to 'Unknown'.
+        combined_type = category_map.get((nii_type, sii_type), 'Unknown')
                 
         combined_results.append(combined_type)
 
@@ -196,7 +264,6 @@ def add_all_central_ionization_types(final_table):
     final_table['central_ionisation_type'] = combined_results
 
     return final_table
-
 
 
 def match_manga_to_radio():
@@ -256,11 +323,39 @@ def match_manga_to_radio():
     print("Rows:", len(final_table))
     print("Columns:", len(final_table.colnames))
 
+
+    # =====================================================
+    # Add alpha_144_1400, alpha_1400_3000, alpha_144_3000
+    # and their errors
+    # =====================================================
+
+    final_table = add_spectral_slopes(final_table)
+
     # =====================================================
     # Add Power Law Fits
     # =====================================================
     
     final_table = add_power_law_fits(final_table)
+
+    fig, ax = plt.subplots()
+    
+    # 2. Extract data
+    power_law_fits = final_table['power_law_slope']
+    alphas = final_table['alpha_144_3000']
+
+    # 3. Create a mask to filter out rows where EITHER value is NaN
+    valid_mask = ~np.isnan(power_law_fits) & ~np.isnan(alphas)
+
+    # 4. Plot only the valid, non-NaN data
+    ax.scatter(power_law_fits[valid_mask], alphas[valid_mask])
+    
+    ax.set_ylabel("Alpha (144 - 3000 MHz)")
+    ax.set_xlabel("Power Law Fits")
+    
+    # 5. Save and close
+    plt.savefig("../manga_rmorph_data/plot.png")
+    print("SAVED!!!!!!")
+    plt.close()
 
     # =====================================================
     # Add Dominant Central ionisation Type
@@ -1796,7 +1891,7 @@ def categorise_central_ionization_type_SII(plate, ifu):
         map_Ha, map_wcs, map_shape = load_fits_data_map(map_file_dir, property_hdu_ext, Ha_channel)
 
         if map_Ha is None:
-            return None
+            return "No Data"
         
         ivar_Ha, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+1, Ha_channel)
         bitmask_Ha, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+2, Ha_channel)
@@ -1851,11 +1946,11 @@ def categorise_central_ionization_type_SII(plate, ifu):
 
     if bpt_map is None:
         print("Skipping; Galaxy MAP not found")
-        return None
+        return "No Data"
 
     if map_wcs is None:
         print(f"  Skipping: Galaxy (WCS) not found")
-        return None  
+        return "No Data"
 
     map_height, map_width = map_shape
     
@@ -1885,7 +1980,6 @@ def categorise_central_ionization_type_SII(plate, ifu):
     numeric_data_SII = np.full(bpt_map.shape, np.nan, dtype=float)
     for category, num_val in mapping_SII.items():
         numeric_data_SII[bpt_map == category] = num_val
-
 
     H, W = numeric_data_SII.shape
     center_y, center_x = H // 2, W // 2
@@ -1918,7 +2012,7 @@ def categorise_central_ionization_type_SII(plate, ifu):
         return "LI(N)ER"
     elif np.isnan(dominant_value):
         # This will trigger if np.nan or None is the dominant type
-        return "Little Ionization" 
+        return "Little Ionisation" 
     else:
         # Catch-all for unexpected numbers
         return "Unknown"
@@ -1954,7 +2048,7 @@ def categorise_central_ionization_type_NII(plate, ifu):
         map_Ha, map_wcs, map_shape = load_fits_data_map(map_file_dir, property_hdu_ext, Ha_channel)
 
         if map_Ha is None:
-            return None
+            return "No Data"
         
         ivar_Ha, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+1, Ha_channel)
         bitmask_Ha, _, __ = load_fits_data_map(map_file_dir, property_hdu_ext+2, Ha_channel)
@@ -2009,11 +2103,11 @@ def categorise_central_ionization_type_NII(plate, ifu):
 
     if bpt_map is None:
         print("Skipping; Galaxy MAP not found")
-        return None
+        return "No Data"
 
     if map_wcs is None:
         print(f"  Skipping: Galaxy (WCS) not found")
-        return None  
+        return "No Data"
 
     map_height, map_width = map_shape
     
@@ -2073,7 +2167,7 @@ def categorise_central_ionization_type_NII(plate, ifu):
 
     elif np.isnan(dominant_value):
         # This will trigger if np.nan or None is the dominant type
-        return "Little Ionization" 
+        return "Little Ionisation" 
     
     else:
         # Catch-all for unexpected numbers

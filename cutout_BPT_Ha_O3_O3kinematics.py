@@ -16,7 +16,6 @@ warnings.filterwarnings('ignore')
 path_data_final = "../manga_rmorph_data/manga_with_vlass_lotss_first.fits"
 data_final = fits.open(path_data_final)[1].data
 
-
 manga_targets = funcs.get_target_info(data_final)
 
 print(len(manga_targets))

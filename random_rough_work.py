@@ -15,20 +15,22 @@ from matplotlib.lines import Line2D
 from matplotlib.colors import ListedColormap
 import statistics
 
-data = funcs.match_manga_to_radio()
+# data = funcs.match_manga_to_radio()
 
-# path_data_final = "../manga_rmorph_data/manga_with_vlass_lotss_first_with_power_law.fits"
-# data_final = fits.open(path_data_final)[1].data
+path_data_final = "../manga_rmorph_data/manga_with_vlass_lotss_first.fits"
+data_final = fits.open(path_data_final)[1].data
 
-# manga_targets = funcs.get_target_info(data_final)
+print(data_final.columns)
+n = 0
+type1 = "Little Ionization"
+type2 = "Little Ionization"
 
-# for i in range(len(manga_targets)):
-    
-#     if manga_targets[i]['mangaid'] == "1-617323":
-#         n = i
+for i in range(len(data_final)):
 
+    if data_final['central_ionisation_type_NII'][i] == type1:
 
-# print(manga_targets[n]['mangaid'])
-# print(funcs.categorise_central_ionization_type_NII(manga_targets[n]))
+        if data_final['central_ionisation_type_SII'][i] == type2:
 
-# print(manga_targets[n]['mangaid'])
+            n = n+1
+
+print(n)
